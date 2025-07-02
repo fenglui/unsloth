@@ -107,7 +107,7 @@ import torch
 import numpy as np
 from contextlib import nullcontext
 from torch.nn import functional as F
-from transformers import DataCollatorForSeq2Seq, DataCollatorForLanguageModeling
+from transformers import DataCollatorForSeq2Seq, DataCollatorForLanguageModeling as TransformersDataCollatorForLanguageModeling
 
 torch_compile_options = {{
     "epilogue_fusion"   : True,
@@ -236,7 +236,9 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
     if "args" in call_args and "model" in call_args:
         mixed_precision = \
         "use_bf16 = getattr(args, 'bf16', False)\n"\
+        "if type(use_bf16) is not bool: use_bf16 = False\n"\
         "use_fp16 = getattr(args, 'fp16', False)\n"\
+        "if type(use_fp16) is not bool: use_fp16 = False\n"\
         "force_float32 = False\n"\
         "if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1':\n"\
         "    print('Unsloth: Switching to float32 training since model cannot work with float16')\n"\
@@ -293,7 +295,9 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
         "    if eval_bsz == 8 and args.per_device_train_batch_size < eval_bsz: args.per_device_eval_batch_size = args.per_device_train_batch_size\n"\
         "    if getattr(args, 'eval_accumulation_steps', None) is None and ga_steps is not None: args.eval_accumulation_steps = ga_steps\n"\
         "fp16_full_eval = getattr(args, 'fp16_full_eval', False)\n"\
+        "if type(fp16_full_eval) is not bool: fp16_full_eval = False\n"\
         "bf16_full_eval = getattr(args, 'bf16_full_eval', False)\n"\
+        "if type(bf16_full_eval) is not bool: bf16_full_eval = False\n"\
         "if args.fp16 and bf16_full_eval: args.bf16_full_eval = False; args.fp16_full_eval = True\n"\
         "if args.bf16 and fp16_full_eval: args.bf16_full_eval = True; args.fp16_full_eval = False\n"\
         "if force_float32:\n"\
@@ -336,6 +340,33 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
         "                   the maximum the model supports is ' + str(model_max_seq_length) + '. We shall reduce it.')\n"\
         "            args.max_seq_length = model_max_seq_length\n"
         extra_args += length_check
+
+        # At this point max_seq_length might be set, but trl is moving to max_length
+        if trainer_file == "sft_trainer":
+            max_length_check = \
+            "if 'max_length' not in locals() and not hasattr(args, 'max_length'):\n"\
+            "    pass\n"\
+            "else:\n"\
+            "    if hasattr(args, 'max_seq_length') and args.max_seq_length is not None and args.max_seq_length > 0:\n"\
+            "        if hasattr(args, 'max_length'):\n"\
+            "            args.max_length = args.max_seq_length\n"\
+            "            max_length = args.max_length\n"\
+            "    else:\n"\
+            "        model_max_length = getattr(model, 'max_seq_length', None)\n"\
+            "        # print(model_max_length, 'mml1')\n"\
+            "        if model_max_length is None: model_max_length = getattr(model, 'max_length', None)\n"\
+            "        # print(model_max_length, 'mml2')\n"\
+            "        if model_max_length is not None:\n"\
+            "            args.max_length = model_max_length\n"\
+            "            max_length = args.max_length\n"\
+            "        elif hasattr(args, 'max_length') and args.max_length is not None:\n"\
+            "            max_length = args.max_length\n"\
+            "            # if we are here, then we are in a weird case where max_length is set but max_seq_length is not set\n"\
+            "            setattr(model, 'max_seq_length', max_length)\n"\
+            "        else:\n"\
+            "            print('Unsloth: We did not find `max_seq_length` or `max_length` in the model or args. We will set it to 1024.')\n"\
+            "            args.max_length = 1024\n"
+            extra_args += max_length_check
     pass
 
     # Enable for training and move padding side of tokenizer to right
@@ -358,8 +389,8 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
         "from unsloth_zoo.vision_utils import UnslothVisionDataCollator\n"\
         "if not isinstance(data_collator, UnslothVisionDataCollator):\n"\
         "    if isinstance(data_collator, DataCollatorForSeq2Seq) and 'labels' not in train_dataset.column_names:\n"\
-        "        data_collator = DataCollatorForLanguageModeling(__tokenizer, mlm = False)\n"\
-        "    elif isinstance(data_collator, DataCollatorForLanguageModeling) and 'labels' in train_dataset.column_names:\n"\
+        "        data_collator = TransformersDataCollatorForLanguageModeling(__tokenizer, mlm = False, mlm_probability = 0.0)\n"\
+        "    elif isinstance(data_collator, TransformersDataCollatorForLanguageModeling) and 'labels' in train_dataset.column_names:\n"\
         "        data_collator = DataCollatorForSeq2Seq(__tokenizer)\n"\
         "else:\n"\
         "    if hasattr(args, 'remove_unused_columns'): args.remove_unused_columns = False\n"\
@@ -374,7 +405,7 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
         "        if isinstance(data_collator, DataCollatorForSeq2Seq):\n"\
         "            data_collator = DataCollatorForSeq2Seq(__tokenizer.tokenizer)\n"\
         "        else:\n"\
-        "            data_collator = DataCollatorForLanguageModeling(__tokenizer.tokenizer, mlm = False)\n"
+        "            data_collator = TransformersDataCollatorForLanguageModeling(__tokenizer.tokenizer, mlm = False, mlm_probability = 0.0)\n"
         extra_args += pad_check
     pass
 
@@ -395,7 +426,7 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
     if trainer_file in RL_METRICS_CHANGES:
         process_extra_args = RL_METRICS_CHANGES[trainer_file]
         for process_extra_arg in process_extra_args:
-            other_metrics_processor += process_extra_arg(call_args, extra_args)
+            other_metrics_processor += process_extra_arg(old_RLTrainer_source, old_RLConfig_source)
     pass
 
     # Add statistics as well!
@@ -444,12 +475,30 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
         "num_generations"             : 8,
         "top_k"                       : None,
         "vllm_mode"                   : "colocate",
+        "generation_kwargs"           : {},
+        "bf16"                        : False,
+        "fp16"                        : False,
     }
     for k, v in replacements.items():
         x = f"{k}( = [^,\n]{{1,}})?,\n"
         y = f"'{v}'" if type(v) is str else f"{v}"
         y = f"{k} = {y},\n"
         arguments = re.sub(x, y, arguments)
+    pass
+
+    # Fix GRPO beta default as 0.001 TRL used to be 0.04, now 0.00!
+    # https://github.com/huggingface/trl/pull/3516
+    # https://verl.readthedocs.io/en/latest/examples/config.html
+    if trainer_file == "grpo_trainer":
+        replacements = {
+            "beta" : 0.001,
+        }
+        for k, v in replacements.items():
+            x = f"{k}( = [^,\n]{{1,}})?,\n"
+            y = f"'{v}'" if type(v) is str else f"{v}"
+            y = f"{k} = {y},\n"
+            arguments = re.sub(x, y, arguments)
+        pass
     pass
 
     # Warn on too large or too small learning rate
@@ -479,6 +528,55 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
         "    from multiprocessing import cpu_count\n"\
         "    dataset_num_proc = cpu_count()\n"
         extra_args += num_proc_check
+    pass
+
+    # Check for loss_type = dr_grpo and scale_rewards for GRPO
+    if "loss_type" in call_args and "scale_rewards" in call_args:
+        # See https://github.com/huggingface/trl/issues/3130#issuecomment-2746947835
+        # DAPO uses per token loss so BNPO loss used
+        check_dr_grpo = \
+        "if loss_type.lower() == 'dr_grpo':\n"\
+        "    loss_type = 'dr_grpo'\n"\
+        "elif loss_type.lower() == 'dapo':\n"\
+        "    loss_type = 'dapo'\n"\
+        "if loss_type.lower() == 'dr_grpo':\n"\
+        "    if scale_rewards == None:\n"\
+        "        scale_rewards = True\n"\
+        "    elif scale_rewards == True:\n"\
+        "        print('Unsloth: The Dr GRPO paper recommends setting `scale_rewards` to False! Will override. Set it to `None` to force False.')\n"\
+        "        scale_rewards = False\n"\
+        "elif loss_type.lower() == 'dapo':\n"\
+        "    print('Unsloth: The DAPO paper recommends `mask_truncated_completions = True`')\n"\
+        "    print('Unsloth: The DAPO paper recommends `epsilon_high = 0.28`')\n"\
+        "    print('Unsloth: The DAPO paper recommends setting `beta = 0.0` to remove the KL term')\n"\
+        "    mask_truncated_completions = True\n"\
+        "    epsilon_high = 0.28\n"\
+        "    beta = 0.0\n"\
+        "    loss_type = 'bnpo'\n"\
+        "\n"
+        extra_args += check_dr_grpo
+    pass
+
+    # Check GRPO num_generations mismatch
+    if "per_device_train_batch_size" in call_args and "num_generations" in call_args: 
+        check_num_generations = \
+        "if (per_device_train_batch_size // num_generations) * num_generations != per_device_train_batch_size:\n"\
+        "    print('Unsloth: We now expect `per_device_train_batch_size` to be a multiple of `num_generations`.\\n"\
+                   "We will change the batch size of ' + str(per_device_train_batch_size) + ' to the `num_generations` of ' + str(num_generations))\n"\
+        "    per_device_train_batch_size = num_generations\n"\
+        "\n"
+        extra_args += check_num_generations
+    pass
+
+    # Check temperature must not be <= 0. Also stop if >= 10
+    if "temperature" in call_args: 
+        check_temperature = \
+        "if temperature <= 0:\n"\
+        "    raise MathError('Unsloth: Please set a positive non-zero temperature since your results will be wrong.')\n"\
+        "elif temperature >= 10:\n"\
+        "    raise MathError('Unsloth: Please set a positive non-zero temperature less than 10, since sampling will be quite erratic.')\n"\
+        "\n"
+        extra_args += check_temperature
     pass
 
     # Edit config with anything extra
@@ -585,6 +683,18 @@ def patch_functions(RLTrainer, trainer_file, RLTrainer_name, all_imports, import
     init = inspect.getsource(RLTrainer.__init__)
     old_init = init
 
+    # Remove brackets in comments since it interferes ie (...)
+    comments = re.findall(r"\#[^\n]{1,}\n", init)
+    bracketed_comments = [x for x in comments if "(" in x or ")" in x]
+    # Replace with [...] instead
+    for bracketed_comment in bracketed_comments:
+        init = init.replace(
+            bracketed_comment,
+            bracketed_comment.replace("(", "[").replace(")", "]"),
+        )
+    pass
+
+
     # Remove peft_config
     init = init.replace("elif peft_config is None:", "elif False:")
     init = init.replace("elif peft_config is not None:", "elif False:")
@@ -674,7 +784,7 @@ def patch_functions(RLTrainer, trainer_file, RLTrainer_name, all_imports, import
 
         if trl_version >= "0.18":
             # Replace LLM init with already existing vLLM engine for colocate mode
-            vllm_llm_init_pattern = r"self\.llm\s*=\s*LLM\([^)]*\)*\)"
+            vllm_llm_init_pattern = r"self\.llm\s*=\s*LLM\(.*?\)*\)\s*?\n(?!,)"
             vllm_llm_replacement = "self.llm = model.vllm_engine\n"
             new_vllm_part = re.sub(
                 vllm_llm_init_pattern,

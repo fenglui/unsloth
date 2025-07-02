@@ -78,7 +78,17 @@ class SyntheticDataKit:
             use_bitsandbytes       = False,
             **kwargs,
         )
-
+        if "dtype" in engine_args:
+            dtype_val = engine_args["dtype"]
+            # Convert torch.bfloat16, torch.float16, etc. to valid CLI string
+            if hasattr(dtype_val, "name"):
+                engine_args["dtype"] = dtype_val.name
+            elif isinstance(dtype_val, str) and dtype_val.startswith("torch."):
+                engine_args["dtype"] = dtype_val.split(".")[-1]
+            # Only allow valid vLLM choices
+            valid_dtypes = {"auto", "bfloat16", "float", "float16", "float32", "half"}
+            if engine_args["dtype"] not in valid_dtypes:
+                engine_args["dtype"] = "auto"
         if "device" in engine_args: del engine_args["device"]
         if "model"  in engine_args: del engine_args["model"]
         if "compilation_config" in engine_args:
@@ -95,6 +105,9 @@ class SyntheticDataKit:
                 # Ignore --enforce-eager True
                 subprocess_commands += ["--" + flag,]
             elif which == "False":
+                # Ignore flag
+                pass
+            elif which == "None":
                 # Ignore flag
                 pass
             else:
